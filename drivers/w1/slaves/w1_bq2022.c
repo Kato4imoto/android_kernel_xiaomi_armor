@@ -112,7 +112,6 @@ int w1_bq2022_get_battery_id(void)
 static int w1_bq2022_add_slave(struct w1_slave *sl)
 {
 	char cmd[4];
-	u8 crc, calc_crc;
 	int retries = 5;
 	bq2022_battery_info battery_info;
 
@@ -143,9 +142,7 @@ retry:
 	w1_write_block(sl->master, cmd, 4);
 
 	/* crc verified for read comm byte and addr 2 bytes*/
-	crc = w1_read_8(sl->master);
-	calc_crc = w1_calc_crc8(&cmd[1], 3);
-	if (calc_crc != crc) {
+	if (w1_read_8(sl->master) != w1_calc_crc8(&cmd[1], 3)) {
 		pr_err("%s: com crc err\n", __func__);
 		goto retry;
 	}
@@ -154,9 +151,7 @@ retry:
 	w1_read_block(sl->master, (char*) &battery_info, sizeof(battery_info));
 
 	/* crc verified for data */
-	crc = w1_read_8(sl->master);
-	calc_crc = w1_calc_crc8((char*) &battery_info, sizeof(battery_info));
-	if (calc_crc != crc) {
+	if (w1_read_8(sl->master) != w1_calc_crc8((char*) &battery_info, sizeof(battery_info))) {
 		pr_err("%s: w1_bq2022 data crc err\n", __func__);
 		goto retry;
 	}
