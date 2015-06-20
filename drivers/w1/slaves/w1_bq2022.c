@@ -54,14 +54,17 @@
 #define BQ2022_BATTERY_INFO_MAGIC			0xE54C21ED
 typedef struct //1024 bit
 {
-	unsigned int magic;
-	unsigned int pad1;
-	unsigned int data1 : 8;
-	unsigned int pad2 : 24;
-	unsigned int pad3[12];
-	unsigned int pad4 : 8;
-	unsigned int data2 : 24;
-	unsigned int pad5[16];
+	unsigned int magic;		//0xe54c21ed
+	unsigned int pad1;		//0x2e4ba9ed
+	unsigned int data1 : 8;		//0x68
+	unsigned int pad2 : 24;		//0xbec6d4
+	unsigned int pad3;		//0xf5b6c85e
+	unsigned int pad4[4];		//0xbe726290, 0x3758921c, 0x46299b2b, 0xc507016b
+	unsigned int pad5[4];		//0xbe726290, 0x3758921c, 0x46299b2b, 0xc507016b
+	unsigned int pad6[3];		//0x5d83414a, 0xf3e83a86, 0x8e356c17
+	unsigned int pad7 : 8;		//0x11
+	unsigned int data2 : 24;	//0x101394
+	unsigned int unused[16];	//ff...
 } __attribute__((packed)) bq2022_battery_info;
 
 static unsigned int w1_bq2022_battery_info_id = 0;
@@ -107,6 +110,60 @@ int w1_bq2022_get_battery_id(void)
 	}
 
 	return ret;
+}
+
+static void w1_bq2022_print_battery(void)
+{
+	switch(w1_bq2022_battery_info_id) {
+	case BQ2022_ID_LG_DESA: pr_err("%s: BQ2022_ID_LG_DESA\n", __func__); break;
+	case BQ2022_ID_COSLIGHT: pr_err("%s: BQ2022_ID_COSLIGHT\n", __func__); break;
+	case BQ2022_ID_SAMSUNG_XWD: pr_err("%s: BQ2022_ID_SAMSUNG_XWD\n", __func__); break;
+	case BQ2022_ID_AAC: pr_err("%s: BQ2022_ID_AAC\n", __func__); break;
+	case BQ2022_ID_SAMSUNG_FMT: pr_err("%s: BQ2022_ID_SAMSUNG_FMT\n", __func__); break;
+	case BQ2022_ID_SONY_XWD: pr_err("%s: BQ2022_ID_SONY_XWD\n", __func__); break;
+	case BQ2022_ID_SONY_FMT: pr_err("%s: BQ2022_ID_SONY_FMT\n", __func__); break;
+	case BQ2022_ID_DELSA: pr_err("%s: BQ2022_ID_DELSA\n", __func__); break;
+	case BQ2022_ID_GUANGYU: pr_err("%s: BQ2022_ID_GUANGYU\n", __func__); break;
+	case BQ2022_ID_RUISHENG: pr_err("%s: BQ2022_ID_RUISHENG\n", __func__); break;
+	case BQ2022_ID_SAMSUNG_XWD_COSTDOWN: pr_err("%s: BQ2022_ID_SAMSUNG_XWD_COSTDOWN\n", __func__); break;
+	default: pr_err("%s: unknown\n", __func__); break;
+	}
+}
+
+unsigned char outbuff[1024 * 10];
+
+static void pr_hexdump(void *addr, int len) {
+	int i;
+	unsigned char textbuff[17];
+	unsigned char *pc = (unsigned char*)addr;
+
+	for (i = 0; i < len; i++)
+	{
+		if ((i % 16) == 0)
+		{
+			if (i != 0)
+				sprintf(outbuff, "%s  %s\n", outbuff, textbuff);
+
+			sprintf(outbuff, "%s%08x ", outbuff, i);
+		}
+
+		sprintf(outbuff, "%s %02x", outbuff, pc[i]);
+
+		if (pc[i] < 0x20 || pc[i] > 0x7e)
+			textbuff[i % 16] = '.';
+		else
+			textbuff[i % 16] = pc[i];
+		textbuff[(i % 16) + 1] = '\0';
+	}
+
+	for (; (i % 16) != 0; i++)
+	{
+		sprintf(outbuff, "%s   ", outbuff);
+	}
+
+	sprintf(outbuff, "%s  %s\n", outbuff, textbuff);
+
+	printk(outbuff);
 }
 
 static int w1_bq2022_add_slave(struct w1_slave *sl)
@@ -161,7 +218,11 @@ retry:
 		return -1;
 	}
 
+	pr_hexdump(&battery_info, sizeof(battery_info));
+
 	w1_bq2022_battery_info_id = battery_info.data1 | battery_info.data2 << 8;
+
+	w1_bq2022_print_battery();
 
 	return 0;
 }
