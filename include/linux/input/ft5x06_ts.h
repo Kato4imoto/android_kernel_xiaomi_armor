@@ -1,10 +1,9 @@
 /*
  *
- * Copyright (c) 2010  Focal tech Ltd.
- * Copyright (c) 2012, Code Aurora Forum. All rights reserved.
  * FocalTech ft5x06 TouchScreen driver header file.
  *
- * Copyright (C) 2015 XiaoMi, Inc. All rights reserved.
+ * Copyright (c) 2010  Focal tech Ltd.
+ * Copyright (c) 2012, Code Aurora Forum. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -46,11 +45,6 @@ struct ft5x06_keypad_data {
 	int *key_pos;
 };
 
-struct ft5x06_test_data {
-	int tx_num;
-	int rx_num;
-};
-
 struct ft5x06_ts_platform_data {
 	unsigned long irqflags;
 	u32 x_max;
@@ -64,13 +58,14 @@ struct ft5x06_ts_platform_data {
 	u32 cfg_size;
 	struct ft5x06_firmware_data *firmware; /* terminated by 0 size */
 	struct ft5x06_keypad_data *keypad;
-	struct ft5x06_test_data *testdata;
 	bool i2c_pull_up;
 
 	unsigned long                landing_jiffies;
 	int                                landing_threshold;
 	int                                staying_threshold;
 	int                                moving_threshold;
+	int                                tx_num;
+	int                                rx_num;
 	u16                              raw_min;
 	u16                              raw_max;
 	/* optional callback for platform needs */

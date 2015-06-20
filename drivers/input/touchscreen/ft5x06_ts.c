@@ -13,9 +13,6 @@
  */
 
 #include <linux/delay.h>
-#ifdef CONFIG_HAS_EARLYSUSPEND
-#include <linux/earlysuspend.h>
-#endif
 #include <linux/firmware.h>
 #include <linux/gpio.h>
 #include <linux/init.h>
@@ -31,8 +28,13 @@
 #include <linux/wakelock.h>
 #include <linux/power_supply.h>
 #include <linux/input/mt.h>
-#include <asm-generic/cputime.h>
 #include "ft5x06_ts.h"
+#if defined(CONFIG_FB)
+#include <linux/notifier.h>
+#include <linux/fb.h>
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
+#include <linux/earlysuspend.h>
+#endif
 
 //register address
 #define FT5X0X_REG_DEVIDE_MODE	0x00
@@ -58,6 +60,17 @@
 #define FT5X0X_POWER_ACTIVE             0x00
 #define FT5X0X_POWER_MONITOR            0x01
 #define FT5X0X_POWER_HIBERNATE          0x03
+
+
+/* ft5x0x register list */
+#define FT5X0X_TOUCH_LENGTH		6
+
+#define FT5X0X_TOUCH_XH			0x00 /* offset from each touch */
+#define FT5X0X_TOUCH_XL			0x01
+#define FT5X0X_TOUCH_YH			0x02
+#define FT5X0X_TOUCH_YL			0x03
+#define FT5X0X_TOUCH_PRESSURE		0x04
+#define FT5X0X_TOUCH_SIZE		0x05
 
 /* ft5x0x bit field definition */
 #define FT5X0X_MODE_NORMAL		0x00
@@ -131,27 +144,11 @@ struct ft5x06_packet {
 	u8  payload[FT5X0X_PACKET_LENGTH];
 };
 
-struct ft5x06_touch_data {
-	u8 xhi : 4;
-	u8 pad : 2;
-	u8 event_up : 1;
-	u8 event_contact: 1;
-	u8 x;
-
-	u8 yhi : 4;
-	u8 id : 4;
-	u8 y;
-
-	u8 pressure;
-	u8 size;
-} __attribute__ ((packed));
-
 struct ft5x06_finger {
 	int x, y;
 	int size;
 	int pressure;
 	bool detect;
-	cputime64_t time;
 };
 
 struct ft5x06_tracker {
@@ -171,9 +168,6 @@ struct ft5x06_data {
 	struct regulator *vdd;
 	struct regulator *vcc_i2c;
 	const struct ft5x06_bus_ops *bops;
-#ifdef CONFIG_HAS_EARLYSUSPEND
-	struct early_suspend early_suspend;
-#endif
 	struct ft5x06_tracker tracker[FT5X0X_MAX_FINGER];
 	int  irq;
 	bool dbgdump;
@@ -182,10 +176,11 @@ struct ft5x06_data {
 	struct delayed_work noise_filter_delayed_work;
 	u8 chip_id;
 	u8 is_usb_plug_in;
-	int current_index;
-
-	struct input_dev * power_input;
-	struct ft5x06_finger power_finger;	
+#if defined(CONFIG_FB)
+	struct notifier_block fb_notif;
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
+	struct early_suspend early_suspend;
+#endif
 };
 
 static int ft5x06_recv_byte(struct ft5x06_data *ft5x06, u8 len, ...)
@@ -242,12 +237,12 @@ static int ft5x06_write_byte(struct ft5x06_data *ft5x06, u8 addr, u8 data)
 }
 
 
-static void ft5x06_charger_state_changed(struct ft5x06_data *ft5x06, bool force_update)
+static void ft5x06_charger_state_changed(struct ft5x06_data *ft5x06)
 {
 	u8 is_usb_exist;
 
 	is_usb_exist = power_supply_is_system_supplied();
-	if ((is_usb_exist != ft5x06->is_usb_plug_in) || (force_update)) {
+	if (is_usb_exist != ft5x06->is_usb_plug_in) {
 		ft5x06->is_usb_plug_in = is_usb_exist;
 		dev_info(ft5x06->dev, "Power state changed, set noise filter to 0x%x\n", is_usb_exist);
 		mutex_lock(&ft5x06->mutex);
@@ -262,7 +257,7 @@ static void ft5x06_noise_filter_delayed_work(struct work_struct *work)
 	struct ft5x06_data *ft5x06 = container_of(delayed_work, struct ft5x06_data, noise_filter_delayed_work);
 
 	dev_info(ft5x06->dev, "ft5x06_noise_filter_delayed_work called\n");
-	ft5x06_charger_state_changed(ft5x06, true);
+	ft5x06_charger_state_changed(ft5x06);
 }
 
 static int ft5x06_power_supply_event(struct notifier_block *nb, unsigned long event, void *ptr)
@@ -271,8 +266,10 @@ static int ft5x06_power_supply_event(struct notifier_block *nb, unsigned long ev
 
 	if (ft5x06->dbgdump)
 		dev_info(ft5x06->dev, "Power_supply_event\n");
-	
-	ft5x06_charger_state_changed(ft5x06, false);
+	if (!ft5x06->in_suspend)
+		ft5x06_charger_state_changed(ft5x06);
+	else if (ft5x06->dbgdump)
+		dev_info(ft5x06->dev, "Don't response to power supply event in suspend mode!\n");
 
 	return 0;
 }
@@ -499,7 +496,6 @@ static int ft5x06_load_firmware(struct ft5x06_data *ft5x06,
 				if(ft5x06->chip_id == firmware->chip) {
 					dev_info(ft5x06->dev, "chip id = 0x%x, found it!\n",
 						ft5x06->chip_id);
-					ft5x06->current_index = i;
 					break;
 				}
 				else
@@ -749,9 +745,8 @@ static int ft5x06_load_firmware(struct ft5x06_data *ft5x06,
 static int ft5x06_collect_finger(struct ft5x06_data *ft5x06,
 				struct ft5x06_finger *finger, int count)
 {
-	u8 number;
+	u8 number, buf[256];
 	int i, error;
-	struct ft5x06_touch_data buf[FT5X0X_MAX_FINGER];
 
 	error = ft5x06_read_byte(ft5x06, FT5X0X_REG_TD_STATUS, &number);
 	if (error)
@@ -762,30 +757,37 @@ static int ft5x06_collect_finger(struct ft5x06_data *ft5x06,
 		number = FT5X0X_MAX_FINGER;
 
 	error = ft5x06_read_block(ft5x06, FT5X0X_REG_TOUCH_START,
-				buf, sizeof(*buf) * number);
+				buf, FT5X0X_TOUCH_LENGTH*number);
 	if (error)
 		return error;
 
 	/* clear the finger buffer */
-	memset(finger, 0, sizeof(*finger) * count);
+	memset(finger, 0, sizeof(*finger)*count);
 
 	for (i = 0; i < number; i++) {
-		u8 id = buf[i].id;
+		u8 xh = buf[FT5X0X_TOUCH_LENGTH*i+FT5X0X_TOUCH_XH];
+		u8 xl = buf[FT5X0X_TOUCH_LENGTH*i+FT5X0X_TOUCH_XL];
+		u8 yh = buf[FT5X0X_TOUCH_LENGTH*i+FT5X0X_TOUCH_YH];
+		u8 yl = buf[FT5X0X_TOUCH_LENGTH*i+FT5X0X_TOUCH_YL];
+
+		u8 size     = buf[FT5X0X_TOUCH_LENGTH*i+FT5X0X_TOUCH_SIZE];
+		u8 pressure = buf[FT5X0X_TOUCH_LENGTH*i+FT5X0X_TOUCH_PRESSURE];
+
+		u8 id = (yh&0xf0)>>4;
 		if (id >= FT5X0X_MAX_FINGER)
 			id = FT5X0X_MAX_FINGER - 1;
 
-		finger[id].x = (buf[i].xhi << 8) | buf[i].x;
-		finger[id].y = (buf[i].yhi << 8) | buf[i].y;
-		finger[id].size = buf[i].size;
-		finger[id].pressure = buf[i].pressure;
-		finger[id].detect = !buf[i].event_up;
-		finger[id].time = ktime_to_ms(ktime_get());
+		finger[id].x        = ((xh&0x0f)<<8)|xl;
+		finger[id].y        = ((yh&0x0f)<<8)|yl;
+		finger[id].size     = size;
+		finger[id].pressure = pressure;
+		finger[id].detect   = (xh&FT5X0X_EVENT_MASK) != FT5X0X_EVENT_UP;
 
 		if (ft5x06->dbgdump)
 			dev_info(ft5x06->dev,
-				"fig(%02u): D: %d X: %04d Y: %04d P: %03d S: %03d %08lld\n", id,
-				finger[id].detect, finger[id].x, finger[id].y,
-				finger[id].pressure, finger[id].size, finger[id].time);
+				"fig(%02u): %d %04d %04d %03d %03d\n", id,
+				finger[i].detect, finger[i].x, finger[i].y,
+				finger[i].pressure, finger[i].size);
 	}
 
 	return 0;
@@ -864,70 +866,27 @@ static void ft5x06_report_touchevent(struct ft5x06_data *ft5x06,
 			continue;
 		}
 
-		if (ft5x06->in_suspend) {
-			if (ft5x06->dbgdump)
-				dev_info(ft5x06->dev,
-					"sustch(%02d): X: %04d Y: %04d P: %03d S: %03d T: %08lld\n",
-					i, finger[i].x, finger[i].y,
-					finger[i].pressure, finger[i].size,
-					finger[i].time);
-
-			if (finger[i].time - ft5x06->power_finger.time > 200)
-			{
-				if (ft5x06->dbgdump && ft5x06->power_finger.time != 0)
-					dev_info(ft5x06->dev, "diff: %04d %04d %08lld\n",
-							(finger[i].x > ft5x06->power_finger.x ?
-								(finger[i].x - ft5x06->power_finger.x) :
-								(ft5x06->power_finger.x - finger[i].x)),
-							(finger[i].y > ft5x06->power_finger.y ?
-								(finger[i].y - ft5x06->power_finger.y) :
-								(ft5x06->power_finger.y - finger[i].y)),
-							finger[i].time - ft5x06->power_finger.time);
-
-				if(
-					finger[i].time - ft5x06->power_finger.time < 500 &&
-					(finger[i].x > ft5x06->power_finger.x ?
-						(finger[i].x - ft5x06->power_finger.x) :
-						(ft5x06->power_finger.x - finger[i].x)) < 50 &&
-					(finger[i].y > ft5x06->power_finger.y ?
-						(finger[i].y - ft5x06->power_finger.y) :
-						(ft5x06->power_finger.y - finger[i].y)) < 50
-				)
-				{
-					input_report_key(ft5x06->power_input, KEY_POWER, 1);
-					input_report_key(ft5x06->power_input, KEY_POWER, 0);
-					input_sync(ft5x06->power_input);
-
-					if (ft5x06->dbgdump)
-						dev_info(ft5x06->dev, "power key sent");
-
-					memset(&ft5x06->power_finger, 0, sizeof(ft5x06->power_finger));
-				} else
-					ft5x06->power_finger = finger[i];
-			}
-		} else {
 #ifdef CONFIG_TOUCHSCREEN_FT5X06_TYPEB
-			input_mt_report_slot_state(ft5x06->input, MT_TOOL_FINGER, 1);
+		input_mt_report_slot_state(ft5x06->input, MT_TOOL_FINGER, 1);
 #endif
-			input_report_abs(ft5x06->input, ABS_MT_TRACKING_ID, i);
-			input_report_abs(ft5x06->input, ABS_MT_POSITION_X ,
-				max(1, finger[i].x)); /* for fruit ninja */
-			input_report_abs(ft5x06->input, ABS_MT_POSITION_Y ,
-				max(1, finger[i].y)); /* for fruit ninja */
-			input_report_abs(ft5x06->input, ABS_MT_TOUCH_MAJOR,
-				max(1, finger[i].pressure));
-			input_report_abs(ft5x06->input, ABS_MT_WIDTH_MAJOR,
-				max(1, finger[i].size));
+		input_report_abs(ft5x06->input, ABS_MT_TRACKING_ID, i);
+		input_report_abs(ft5x06->input, ABS_MT_POSITION_X ,
+			max(1, finger[i].x)); /* for fruit ninja */
+		input_report_abs(ft5x06->input, ABS_MT_POSITION_Y ,
+			max(1, finger[i].y)); /* for fruit ninja */
+		input_report_abs(ft5x06->input, ABS_MT_TOUCH_MAJOR,
+			max(1, finger[i].pressure));
+		input_report_abs(ft5x06->input, ABS_MT_WIDTH_MAJOR,
+			max(1, finger[i].size));
 #ifndef CONFIG_TOUCHSCREEN_FT5X06_TYPEB
-			input_mt_sync(ft5x06->input);
-			mt_sync_sent = true;
+		input_mt_sync(ft5x06->input);
+		mt_sync_sent = true;
 #endif
-			if (ft5x06->dbgdump)
-				dev_info(ft5x06->dev,
-					"tch(%02d): %04d %04d %03d %03d\n",
-					i, finger[i].x, finger[i].y,
-					finger[i].pressure, finger[i].size);
-		}
+		if (ft5x06->dbgdump)
+			dev_info(ft5x06->dev,
+				"tch(%02d): %04d %04d %03d %03d\n",
+				i, finger[i].x, finger[i].y,
+				finger[i].pressure, finger[i].size);
 	}
 #ifndef CONFIG_TOUCHSCREEN_FT5X06_TYPEB
 	if (!mt_sync_sent) {
@@ -962,14 +921,14 @@ int ft5x06_suspend(struct ft5x06_data *ft5x06)
 {
 	int error = 0;
 
-	enable_irq_wake(ft5x06->irq);
+	disable_irq(ft5x06->irq);
 	mutex_lock(&ft5x06->mutex);
 	memset(ft5x06->tracker, 0, sizeof(ft5x06->tracker));
 
 	ft5x06->in_suspend = true;
 	cancel_delayed_work_sync(&ft5x06->noise_filter_delayed_work);
 	error = ft5x06_write_byte(ft5x06,
-			FT5X0X_ID_G_PMODE, FT5X0X_POWER_ACTIVE);
+			FT5X0X_ID_G_PMODE, FT5X0X_POWER_HIBERNATE);
 
 	mutex_unlock(&ft5x06->mutex);
 
@@ -993,13 +952,42 @@ int ft5x06_resume(struct ft5x06_data *ft5x06)
 				NOISE_FILTER_DELAY);
 	ft5x06->in_suspend = false;
 	mutex_unlock(&ft5x06->mutex);
-	disable_irq_wake(ft5x06->irq);
+	enable_irq(ft5x06->irq);
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ft5x06_resume);
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+static int fb_notifier_callback(struct notifier_block *self,
+				 unsigned long event, void *data)
+{
+	struct fb_event *evdata = data;
+	int *blank;
+	struct ft5x06_data *ft5x06 =
+		container_of(self, struct ft5x06_data, fb_notif);
+		
+	if (evdata && evdata->data && event == FB_EVENT_BLANK &&
+			ft5x06 && ft5x06->dev) {		
+		blank = evdata->data;
+		switch (*blank) {
+			case FB_BLANK_UNBLANK:
+				pr_info("ft5x06 resume!\n");
+				ft5x06_resume(ft5x06);
+				break;
+			case FB_BLANK_POWERDOWN:
+			case FB_BLANK_HSYNC_SUSPEND:
+			case FB_BLANK_VSYNC_SUSPEND:
+			case FB_BLANK_NORMAL:
+				pr_info("ft5x06 suspend!\n");
+				ft5x06_suspend(ft5x06);
+				break;
+		}
+	}
+
+	return NOTIFY_OK;
+}
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 static void ft5x06_early_suspend(struct early_suspend *h)
 {
 	struct ft5x06_data *ft5x06 = container_of(h,
@@ -1012,26 +1000,6 @@ static void ft5x06_early_resume(struct early_suspend *h)
 	struct ft5x06_data *ft5x06 = container_of(h,
 					struct ft5x06_data, early_suspend);
 	ft5x06_resume(ft5x06);
-}
-#else
-static int ft5x06_input_disable(struct input_dev *in_dev)
-{
-	struct ft5x06_data *ft5x06 = input_get_drvdata(in_dev);
-
-	pr_info("ft5x06 disable!\n");
-	ft5x06_suspend(ft5x06);
-
-	return 0;
-}
-
-static int ft5x06_input_enable(struct input_dev *in_dev)
-{
-	struct ft5x06_data *ft5x06 = input_get_drvdata(in_dev);
-
-	pr_info("ft5x06 enable!\n");
-	ft5x06_resume(ft5x06);
-
-	return 0;
 }
 #endif
 
@@ -1252,21 +1220,18 @@ static int ft5x06_enter_work(struct ft5x06_data *ft5x06_ts)
 	return 0;
 }
 
-#define FT5x0x_MAX_RX_NUM   	22
+#define FT5x0x_TX_NUM		28
+#define FT5x0x_RX_NUM   	16
 static int ft5x06_get_rawData(struct ft5x06_data *ft5x06_ts,
-					 u16 *rawdata)
+					 u16 rawdata[][FT5x0x_RX_NUM])
 {
 	int ret_val = 0;
 	int error;
 	u8 val;
 	int row_num = 0;
-	u8 read_buffer[FT5x0x_MAX_RX_NUM * 2];
+	u8 read_buffer[FT5x0x_RX_NUM * 2];
 	int read_len;
 	int i;
-	struct ft5x06_ts_platform_data *pdata = ft5x06_ts->dev->platform_data;
-	int index = ft5x06_ts->current_index;
-	int tx_num = pdata->testdata[index].tx_num;
-	int rx_num = pdata->testdata[index].rx_num;
 
 	error = ft5x06_read_byte(ft5x06_ts, FT5X0X_REG_DEVIDE_MODE, &val);
 	if (error < 0) {
@@ -1294,8 +1259,8 @@ static int ft5x06_get_rawData(struct ft5x06_data *ft5x06_ts,
 		goto error_return;
 	}
 	dev_info(ft5x06_ts->dev, "Read rawdata......\n");
-	for (row_num = 0; row_num < tx_num; row_num++) {
-		memset(read_buffer, 0x00, rx_num * 2);
+	for (row_num = 0; row_num < FT5x0x_TX_NUM; row_num++) {
+		memset(read_buffer, 0x00, (FT5x0x_RX_NUM * 2));
 		error = ft5x06_write_byte(ft5x06_ts, FT5X0X_REG_ROW_ADDR, row_num);
 		if (error < 0) {
 			dev_err(ft5x06_ts->dev, "ERROR: Write row addr failed!\n");
@@ -1303,7 +1268,7 @@ static int ft5x06_get_rawData(struct ft5x06_data *ft5x06_ts,
 			goto error_return;
 		}
 		msleep(1);
-		read_len = rx_num * 2;
+		read_len = FT5x0x_RX_NUM * 2;
 		error = ft5x06_write_byte(ft5x06_ts, 0x10, read_len);
 		if (error < 0) {
 			dev_err(ft5x06_ts->dev, "ERROR: Write len failed!\n");
@@ -1311,39 +1276,122 @@ static int ft5x06_get_rawData(struct ft5x06_data *ft5x06_ts,
 			goto error_return;
 		}
 		error = ft5x06_read_block(ft5x06_ts, 0x10,
-							read_buffer, rx_num * 2);
+							read_buffer, FT5x0x_RX_NUM * 2);
 		if (error < 0) {
 			dev_err(ft5x06_ts->dev,
 				"ERROR: Coule not read row %u data!\n", row_num);
 			ret_val = -1;
 			goto error_return;
 		}
-		for (i = 0; i < rx_num; i++) {
-			rawdata[row_num * rx_num + i] = read_buffer[i<<1];
-			rawdata[row_num * rx_num + i] = rawdata[row_num * rx_num + i] << 8;
-			rawdata[row_num * rx_num + i] |= read_buffer[(i<<1)+1];
+		for (i = 0; i < FT5x0x_RX_NUM; i++) {
+			rawdata[row_num][i] = read_buffer[i<<1];
+			rawdata[row_num][i] = rawdata[row_num][i] << 8;
+			rawdata[row_num][i] |= read_buffer[(i<<1)+1];
 		}
 	}
 error_return:
 	return ret_val;
 }
 
+static int ft5x06_get_diffData(struct ft5x06_data *ft5x06_ts,
+					 u16 diffdata[][FT5x0x_RX_NUM],
+					 u16 *average)
+{
+	u16 after_rawdata[FT5x0x_TX_NUM][FT5x0x_RX_NUM];
+	int error;
+	int ret_val = 0;
+	u8 reg_value;
+	u8 orig_vol = 0;
+	int i, j;
+	unsigned int total = 0;
+	struct ft5x06_ts_platform_data *pdata = ft5x06_ts->dev->platform_data;
+	int tx_num = pdata->tx_num - 1;
+	int rx_num = pdata->rx_num;
+
+	/*get original voltage and change it to get new frame rawdata*/
+	error = ft5x06_read_byte(ft5x06_ts, FT5X0X_REG_VOLTAGE, &reg_value);
+	if (error < 0) {
+		dev_err(ft5x06_ts->dev, "ERROR: Could not get voltage data!\n");
+		goto error_return;
+	} else
+		orig_vol = reg_value;
+
+	error = ft5x06_write_byte(ft5x06_ts, FT5X0X_REG_VOLTAGE, 0);
+	if (error < 0) {
+		dev_err(ft5x06_ts->dev, "ERROR: Could not set voltage data to 0!\n");
+		goto error_return;
+	}
+
+	for (i = 0; i < 3; i++) {
+		error = ft5x06_get_rawData(ft5x06_ts, diffdata);
+		if (error < 0) {
+			dev_err(ft5x06_ts->dev, "ERROR: Could not get original raw data!\n");
+			ret_val = error;
+			goto error_return;
+		}
+	}
+
+	reg_value = 2;
+
+	dev_info(ft5x06_ts->dev, "original voltage: 0 changed voltage:%u\n",
+		reg_value);
+
+	error = ft5x06_write_byte(ft5x06_ts, FT5X0X_REG_VOLTAGE, reg_value);
+	if (error < 0) {
+		dev_err(ft5x06_ts->dev, "ERROR: Could not set voltage data!\n");
+		ret_val = error;
+		goto error_return;
+	}
+
+	/* get raw data */
+	for (i = 0; i < 3; i++) {
+		error = ft5x06_get_rawData(ft5x06_ts, after_rawdata);
+		if (error < 0) {
+			dev_err(ft5x06_ts->dev, "ERROR: Could not get after raw data!\n");
+			ret_val = error;
+			goto error_voltage;
+		}
+	}
+
+	for (i = 0; i < tx_num; i++) {
+		for (j = 0; j < rx_num; j++) {
+			if (after_rawdata[i][j] > diffdata[i][j])
+				diffdata[i][j] = after_rawdata[i][j] - diffdata[i][j];
+			else
+				diffdata[i][j] = diffdata[i][j] - after_rawdata[i][j];
+
+				total += diffdata[i][j];
+
+			printk(KERN_CONT "%d ", diffdata[i][j]);
+		}
+		pr_info("total = %d\n", total);
+	}
+
+	*average = (u16)(total / (tx_num * rx_num));
+
+error_voltage:
+	error = ft5x06_write_byte(ft5x06_ts, FT5X0X_REG_VOLTAGE, orig_vol);
+	if (error < 0) {
+		ret_val = error;
+		dev_err(ft5x06_ts->dev, "ERROR: Could not get voltage data!\n");
+	}
+
+error_return:
+	return ret_val;
+
+}
+
 static ssize_t ft5x06_rawdata_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
 	struct ft5x06_data *ft5x06 = dev_get_drvdata(dev);
-	struct ft5x06_ts_platform_data *pdata = ft5x06->dev->platform_data;
-	int index = ft5x06->current_index;
-	u16 *rawdata;
+	u16	rawdata[FT5x0x_TX_NUM][FT5x0x_RX_NUM];
 	int error;
 	int i = 0, j = 0;
 	int num_read_chars = 0;
-	int tx_num = pdata->testdata[index].tx_num;
-	int rx_num = pdata->testdata[index].rx_num;
-
-	rawdata = (u16*)kmalloc(sizeof(u16) * tx_num * rx_num, GFP_KERNEL);
-	if (rawdata == NULL)
-		return -ENOMEM;
+	struct ft5x06_ts_platform_data *pdata = ft5x06->dev->platform_data;
+	int tx_num = pdata->tx_num - 1;
+	int rx_num = pdata->rx_num;
 
 	mutex_lock(&ft5x06->mutex);
 
@@ -1361,7 +1409,7 @@ static ssize_t ft5x06_rawdata_show(struct device *dev,
 		for (i = 0; i < tx_num; i++) {
 			for (j = 0; j < rx_num; j++) {
 				num_read_chars += sprintf(&buf[num_read_chars],
-								"%u ", rawdata[i * rx_num + j]);
+								"%u ", rawdata[i][j]);
 			}
 			buf[num_read_chars-1] = '\n';
 		}
@@ -1374,41 +1422,103 @@ static ssize_t ft5x06_rawdata_show(struct device *dev,
 end:
 	enable_irq(ft5x06->irq);
 	mutex_unlock(&ft5x06->mutex);
-	kfree(rawdata);
+	return num_read_chars;
+}
+
+static ssize_t ft5x06_diffdata_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct ft5x06_data *ft5x06 = dev_get_drvdata(dev);
+	u16	diffdata[FT5x0x_TX_NUM][FT5x0x_RX_NUM];
+	int error;
+	int i = 0, j = 0;
+	int num_read_chars = 0;
+	u16 average;
+	struct ft5x06_ts_platform_data *pdata = ft5x06->dev->platform_data;
+	int tx_num = pdata->tx_num - 1;
+	int rx_num = pdata->rx_num;
+
+	mutex_lock(&ft5x06->mutex);
+	disable_irq_nosync(ft5x06->irq);
+	error = ft5x06_enter_factory(ft5x06);
+	if (error < 0) {
+		dev_err(ft5x06->dev, "ERROR: Could not enter factory mode!\n");
+		goto end;
+	}
+
+	error = ft5x06_get_diffData(ft5x06, diffdata, &average);
+	if (error < 0)
+		sprintf(buf, "%s", "Could not get rawdata\n");
+	else {
+		for (i = 0; i < tx_num; i++) {
+			for (j = 0; j < rx_num; j++) {
+				num_read_chars += sprintf(&buf[num_read_chars],
+								"%u ", diffdata[i][j]);
+			}
+			buf[num_read_chars-1] = '\n';
+		}
+	}
+
+	error = ft5x06_enter_work(ft5x06);
+	if (error < 0)
+		dev_err(ft5x06->dev, "ERROR: Could not enter work mode!\n");
+
+end:
+	enable_irq(ft5x06->irq);
+	mutex_unlock(&ft5x06->mutex);
 	return num_read_chars;
 }
 
 unsigned int ft5x06_do_selftest(struct ft5x06_data *ft5x06)
 {
 	struct ft5x06_ts_platform_data *pdata = ft5x06->dev->platform_data;
-	int index = ft5x06->current_index;
-	u16 *testdata;
+	u16 testdata[FT5x0x_TX_NUM][FT5x0x_RX_NUM];
 	int i, j;
 	int error;
-	int tx_num = pdata->testdata[index].tx_num;
-	int rx_num = pdata->testdata[index].rx_num;
-	int final_tx_num = tx_num;
-	int final_rx_num = rx_num;
+	const struct ft5x06_keypad_data *keypad;
+	u16 average;
 
-	testdata = (u16*)kmalloc(sizeof(u16) * tx_num * rx_num, GFP_KERNEL);
-	if (testdata == NULL)
-		return -ENOMEM;
+	for (i = 0; i < pdata->cfg_size; i++) {
+		if (ft5x06->chip_id == pdata->keypad[i].chip) {
+			keypad = &pdata->keypad[i];
+		}
+	}
 
 	/* 1. test raw data */
 	error = ft5x06_get_rawData(ft5x06, testdata);
 	if (error)
 		return 0;
 
-	if (tx_num > rx_num)
-		final_tx_num -= 1;
-	else
-		final_rx_num -= 1;
+	for (i = 0; i < pdata->tx_num; i++) {
+		if (i != pdata->tx_num - 1)  {
+			for (j = 0; j < pdata->rx_num; j++) {
+				if (testdata[i][j] < pdata->raw_min ||
+					testdata[i][j] > pdata->raw_max) {
+						return 0;
+					}
+			}
+		} else {
+			for (j = 0; j < keypad->length; j++) {
+				if (testdata[i][keypad->key_pos[j]] < pdata->raw_min ||
+					testdata[i][keypad->key_pos[j]]  > pdata->raw_max) {
+					return 0;
+				}
+			}
+		}
+	}
 
-	for (i = 0; i < final_tx_num; i++) {
-		for (j = 0; j < final_rx_num; j++) {
-			if (testdata[i * rx_num + j] < pdata->raw_min ||
-				testdata[i * rx_num +j] > pdata->raw_max)
+	/* 2. test diff data */
+	error = ft5x06_get_diffData(ft5x06, testdata, &average);
+	if (error)
+		return 0;
+	for (i = 0; i < pdata->tx_num - 1; i++) {
+		for (j = 0; j < pdata->rx_num; j++) {
+			if ((testdata[i][j] < average * 13 / 20) ||
+				(testdata[i][j] > average * 27 / 20)) {
+				dev_info(ft5x06->dev, "Failed, testdata = %d, average = %d\n",
+					testdata[i][j], average);
 				return 0;
+			}
 		}
 	}
 
@@ -1464,6 +1574,7 @@ static DEVICE_ATTR(object, 0644, ft5x06_object_show, ft5x06_object_store);
 static DEVICE_ATTR(dbgdump, 0644, ft5x06_dbgdump_show, ft5x06_dbgdump_store);
 static DEVICE_ATTR(updatefw, 0200, NULL, ft5x06_updatefw_store);
 static DEVICE_ATTR(rawdatashow, 0644, ft5x06_rawdata_show, NULL);
+static DEVICE_ATTR(diffdatashow, 0644, ft5x06_diffdata_show, NULL);
 static DEVICE_ATTR(selftest, 0644, ft5x06_selftest_show, ft5x06_selftest_store);
 
 static struct attribute *ft5x06_attrs[] = {
@@ -1472,6 +1583,7 @@ static struct attribute *ft5x06_attrs[] = {
 	&dev_attr_dbgdump.attr,
 	&dev_attr_updatefw.attr,
 	&dev_attr_rawdatashow.attr,
+	&dev_attr_diffdatashow.attr,
 	&dev_attr_selftest.attr,
 	NULL
 };
@@ -1604,6 +1716,8 @@ static void ft5x06_dt_dump(struct device *dev,
 	pr_info("landing_jiffies = %d\n", (int)pdata->landing_jiffies);
 	pr_info("landing_threshold = %d\n", (int)pdata->landing_threshold);
 	pr_info("staying_threshold = %d\n", (int)pdata->staying_threshold);
+	pr_info("tx num = %d\n", pdata->tx_num);
+	pr_info("rx num = %d\n", pdata->rx_num);
 	pr_info("raw min = %d\n", (int)pdata->raw_min);
 	pr_info("raw max = %d\n", (int)pdata->raw_max);
 	for (j = 0; j < pdata->cfg_size; j++) {
@@ -1624,6 +1738,10 @@ static void ft5x06_dt_dump(struct device *dev,
 			pdata->firmware[0].chip,
 			pdata->firmware[0].vendor,
 			pdata->firmware[0].fwname);
+	pr_info("firmare 1 chip = 0x%x, vendor = 0x%x name = %s\n",
+			pdata->firmware[1].chip,
+			pdata->firmware[1].vendor,
+			pdata->firmware[1].fwname);
 }
 
 static int ft5x06_parse_dt(struct device *dev,
@@ -1687,6 +1805,17 @@ static int ft5x06_parse_dt(struct device *dev,
 		return rc;
 	}
 
+	rc = of_property_read_u32(np, "ft5x06_i2c,tx-num", &pdata->tx_num);
+	if (rc) {
+		dev_err(dev, "can't read tx-num\n");
+		return rc;
+	}
+	rc = of_property_read_u32(np, "ft5x06_i2c,rx-num", &pdata->rx_num);
+	if (rc) {
+		dev_err(dev, "can't read rx-num\n");
+		return rc;
+	}
+
 	rc = of_property_read_u32(np, "ft5x06_i2c,raw-min", &temp_val);
 	if (rc) {
 		dev_err(dev, "can't read raw-min\n");
@@ -1714,9 +1843,6 @@ static int ft5x06_parse_dt(struct device *dev,
 		return -ENOMEM;
 	pdata->keypad = kmalloc(sizeof(struct ft5x06_keypad_data) * num_fw, GFP_KERNEL);
 	if (pdata->keypad == NULL)
-		return -ENOMEM;
-	pdata->testdata = kmalloc(sizeof(struct ft5x06_test_data) * num_fw, GFP_KERNEL);
-	if (pdata->testdata == NULL)
 		return -ENOMEM;
 
 	pdata->cfg_size = num_fw;
@@ -1800,18 +1926,6 @@ static int ft5x06_parse_dt(struct device *dev,
 			return rc;
 		}
 		pdata->firmware[j].size = 0;
-
-		rc = of_property_read_u32(sub_np, "ft5x06_i2c,tx-num", &pdata->testdata[j].tx_num);
-		if (rc) {
-			dev_err(dev, "can't read tx-num\n");
-			pdata->testdata[j].tx_num = 28;
-		}
-		rc = of_property_read_u32(sub_np, "ft5x06_i2c,rx-num", &pdata->testdata[j].rx_num);
-		if (rc) {
-			dev_err(dev, "can't read rx-num\n");
-			pdata->testdata[j].rx_num = 16;
-		}
-
 		j ++;
 	}
 
@@ -1931,9 +2045,9 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 	input_set_drvdata(ft5x06->input, ft5x06);
 	ft5x06->input->name       = "ft5x06";
 	ft5x06->input->id.bustype = bops->bustype;
-	ft5x06->input->id.vendor  = 0x4654; // FocalTech
-	ft5x06->input->id.product = 0x5000; // ft5x0x
-	ft5x06->input->id.version = 0x0100; // 1.0
+	ft5x06->input->id.vendor  = 0x4654; /* FocalTech */
+	ft5x06->input->id.product = 0x5000; /* ft5x0x    */
+	ft5x06->input->id.version = 0x0100; /* 1.0       */
 	ft5x06->input->dev.parent = dev;
 
 	/* init touch parameter */
@@ -1946,34 +2060,19 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 	set_bit(ABS_MT_WIDTH_MAJOR, ft5x06->input->absbit);
 	set_bit(INPUT_PROP_DIRECT, ft5x06->input->propbit);
 
-	input_set_abs_params(ft5x06->input, ABS_MT_POSITION_X, 0, pdata->x_max, 0, 0);
-	input_set_abs_params(ft5x06->input, ABS_MT_POSITION_Y, 0, pdata->y_max, 0, 0);
-	input_set_abs_params(ft5x06->input, ABS_MT_TOUCH_MAJOR, 0, pdata->z_max, 0, 0);
-	input_set_abs_params(ft5x06->input, ABS_MT_WIDTH_MAJOR, 0, pdata->w_max, 0, 0);
-	input_set_abs_params(ft5x06->input, ABS_MT_TRACKING_ID, 0, 10, 0, 0);
+	input_set_abs_params(ft5x06->input,
+			     ABS_MT_POSITION_X, 0, pdata->x_max, 0, 0);
+	input_set_abs_params(ft5x06->input,
+			     ABS_MT_POSITION_Y, 0, pdata->y_max, 0, 0);
+	input_set_abs_params(ft5x06->input,
+			     ABS_MT_TOUCH_MAJOR, 0, pdata->z_max, 0, 0);
+	input_set_abs_params(ft5x06->input,
+			     ABS_MT_WIDTH_MAJOR, 0, pdata->w_max, 0, 0);
+	input_set_abs_params(ft5x06->input,
+			     ABS_MT_TRACKING_ID, 0, 10, 0, 0);
 
 	set_bit(EV_KEY, ft5x06->input->evbit);
 	set_bit(EV_ABS, ft5x06->input->evbit);
-
-	// POWER
-	memset(&ft5x06->power_finger, 0, sizeof(ft5x06->power_finger));
-	ft5x06->power_input = input_allocate_device();
-	if (!ft5x06->power_input)
-	{
-		dev_err(dev, "failed to allocate power key\n");
-		goto err_free_input;
-	}
-
-	input_set_capability(ft5x06->power_input, EV_KEY, KEY_POWER);
-	ft5x06->power_input->name = "ft5x06_power";
-	ft5x06->power_input->phys = "ft5x06_power/input0";
-
-	error = input_register_device(ft5x06->power_input);
-	if (error) {
-		dev_err(dev, "failed to register power key device\n");
-		goto err_free_input;
-	}
-	// POWER
 
 	error = ft5x06_read_byte(ft5x06, FT5X0X_REG_CHIP_ID, &ft5x06->chip_id);
 	if (error) {
@@ -1987,10 +2086,7 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 		goto err_free_input;
 	}
 
-	ft5x06->input->enable = ft5x06_input_enable;
-	ft5x06->input->disable = ft5x06_input_disable;
 	ft5x06->input->enabled = true;
-
 	/* register input device */
 	error = input_register_device(ft5x06->input);
 	if (error) {
@@ -2008,7 +2104,7 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 
 	/* start interrupt process */
 	error = request_threaded_irq(ft5x06->irq, NULL, ft5x06_interrupt,
-				IRQF_TRIGGER_FALLING | IRQF_NO_SUSPEND, "ft5x06", ft5x06);
+				IRQF_TRIGGER_FALLING, "ft5x06", ft5x06);
 	if (error) {
 		dev_err(dev, "fail to request interrupt\n");
 		goto err_free_phys;
@@ -2039,7 +2135,15 @@ struct ft5x06_data *ft5x06_probe(struct device *dev,
 		goto err_put_vkeys;
 	}
 
-#ifdef CONFIG_HAS_EARLYSUSPEND
+#if defined(CONFIG_FB)
+	ft5x06->fb_notif.notifier_call = fb_notifier_callback;
+
+	 error = fb_register_client(&ft5x06->fb_notif);
+
+	 if (error)
+		 dev_err(dev, "Unable to register fb_notifier: %d\n",
+			 error);
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
 	ft5x06->early_suspend.level   = EARLY_SUSPEND_LEVEL_BLANK_SCREEN+1;
 	ft5x06->early_suspend.suspend = ft5x06_early_suspend;
 	ft5x06->early_suspend.resume  = ft5x06_early_resume;
@@ -2073,9 +2177,13 @@ free_irq_gpio:
 err_power:
 	if (pdata->power_on)
 		pdata->power_on(false);
+	//else
+	//	ft5x06_power_on(ft5x06, false);
 err_power_init:
 	if (pdata->power_init)
 		pdata->power_init(false);
+	//else
+	//	ft5x06_power_init(ft5x06, false);
 err_free_data:
 	kfree(ft5x06);
 err:
